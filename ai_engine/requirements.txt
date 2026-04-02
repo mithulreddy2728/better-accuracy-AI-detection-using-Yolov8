@@ -1,9 +1,9 @@
 opencv-python==4.8.1.78
-numpy==1.24.4
+numpy>=1.26.0
 requests
 Pillow
 torch
 torchvision
 ultralytics
-easyocr
-pytesseract
+paddlepaddle==3.3.0
+paddleocr==2.7.3

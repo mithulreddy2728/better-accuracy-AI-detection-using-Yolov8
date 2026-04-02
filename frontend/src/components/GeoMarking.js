@@ -278,55 +278,76 @@ const GeoMarking = () => {
         </div>
       )}
 
-      {selectedCamera && detections.length > 0 && (
+      {selectedCamera && (
         <div className="detections-list">
           <h2>Detected Vehicles in Geo-Fences</h2>
           <p className="info-text">
             Showing vehicles detected within geo-fenced areas (auto-refreshes every 3 seconds)
           </p>
-          <div className="detections-grid">
-            {detections.map((detection) => (
-              <div key={detection.id} className="detection-card">
-                <div className="detection-header">
-                  <span className="detection-type">{detection.detection_type}</span>
-                  <span className="detection-fence">Geo-Fence #{detection.geo_marker_id}</span>
-                </div>
-                {detection.object_image && (
-                  <img
-                    src={detection.object_image}
-                    alt={detection.detection_type}
-                    className="detection-image"
-                  />
-                )}
-                <div className="detection-info">
-                  <div className="info-row">
-                    <strong>Vehicle ID:</strong> {detection.track_id || detection.id}
+
+          {detections.length > 0 ? (
+            <div className="detections-grid">
+              {detections.map((detection) => (
+                <div key={detection.id} className="detection-card">
+                  <div className="detection-header">
+                    <span className="detection-type">{detection.detection_type}</span>
+                    <span className="detection-fence">Geo-Fence #{detection.geo_marker_id}</span>
                   </div>
-                  <div className="info-row">
-                    <strong>License Plate:</strong>
-                    <span className={detection.numberplate_text ? "plate-text" : "no-plate"}>
-                      {detection.numberplate_text || "Not detected"}
-                    </span>
-                  </div>
-                  {detection.numberplate_image && (
-                    <div className="plate-image-container">
-                      <img
-                        src={detection.numberplate_image}
-                        alt="License Plate"
-                        className="plate-image"
-                      />
-                    </div>
+                  {detection.object_image && (
+                    <img
+                      src={detection.object_image}
+                      alt={detection.detection_type}
+                      className="detection-image"
+                    />
                   )}
-                  <div className="info-row">
-                    <strong>Confidence:</strong> {(detection.confidence_score * 100).toFixed(1)}%
-                  </div>
-                  <div className="info-row timestamp">
-                    {new Date(detection.timestamp).toLocaleString()}
+                  <div className="detection-info">
+                    <div className="info-row">
+                      <strong>Vehicle ID:</strong> {detection.track_id || detection.id}
+                    </div>
+                    <div className="info-row">
+                      <strong>License Plate:</strong>
+                      <span className={detection.numberplate_text ? "plate-text" : "no-plate"}>
+                        {detection.numberplate_text || "Not detected"}
+                      </span>
+                    </div>
+                    {detection.numberplate_image && (
+                      <div className="plate-image-container">
+                        <img
+                          src={detection.numberplate_image}
+                          alt="License Plate"
+                          className="plate-image"
+                        />
+                      </div>
+                    )}
+                    <div className="info-row">
+                      <strong>Confidence:</strong> {(detection.confidence_score * 100).toFixed(1)}%
+                    </div>
+                    <div className="info-row timestamp">
+                      {new Date(detection.timestamp).toLocaleString()}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <div className="no-detections-message">
+              <p>⏳ <strong>No detections in geo-fenced areas yet.</strong></p>
+              {markers.length > 0 ? (
+                <div className="status-info">
+                  <p>✓ You have {markers.length} geo-fence(s) configured.</p>
+                  <p>💡 <strong>To see detections:</strong></p>
+                  <ol style={{ textAlign: 'left', display: 'inline-block', marginTop: '10px' }}>
+                    <li>Go to the <strong>Cameras</strong> page</li>
+                    <li>Delete and re-add Camera {selectedCamera} to reload geo-fences</li>
+                    <li>Wait for objects to enter the geo-fenced area</li>
+                    <li>Detections will appear here automatically</li>
+                  </ol>
+                </div>
+              ) : (
+                <p>⚠️ Please draw a geo-fence ROI above to start detecting objects.</p>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

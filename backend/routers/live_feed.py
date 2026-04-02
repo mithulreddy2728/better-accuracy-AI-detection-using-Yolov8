@@ -12,7 +12,6 @@ from app.database import get_db
 from models.models import Camera, GeoMarker
 from auth.auth import get_current_user
 from ultralytics import YOLO
-import easyocr
 from pathlib import Path
 
 # Add project root to sys.path to allow importing from ai_engine
@@ -73,7 +72,8 @@ def load_models():
         try:
             # Roboflow / Hub model for nozzles
             # Using a known nozzle detector for high-precision
-            MODELS["nozzle"] = YOLO("keremberke/yolov8n-fuel-nozzle-detection").to(MODELS["device"])
+            nozzle_name = "keremberke/yolov8n-fuel-nozzle-detection"
+            MODELS["nozzle"] = YOLO(nozzle_name).to(MODELS["device"])
             print(f"✓ Specialized Nozzle model loaded")
         except:
             print("⚠ Specialized nozzle model fallback to main detector")
@@ -81,11 +81,28 @@ def load_models():
     
     if MODELS["reader"] is None:
         try:
-            # OCR Reader
-            # OCR Reader - Force GPU if available
-            MODELS["reader"] = easyocr.Reader(['en'], gpu=(MODELS["device"] == 'cuda'), verbose=False)
+            import pytesseract
+            from PIL import Image
+            
+            # Configure Tesseract path
+            tesseract_paths = [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                r'C:\Tesseract-OCR\tesseract.exe'
+            ]
+            
+            for path in tesseract_paths:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    break
+            
+            # Test Tesseract
+            test_version = pytesseract.get_tesseract_version()
+            MODELS["reader"] = pytesseract
+            print(f"✓ Tesseract OCR initialized for live feed (version: {test_version})")
         except Exception as e:
-            print(f"Error loading OCR reader: {e}")
+            print(f"⚠ Failed to initialize Tesseract: {e}")
+            MODELS["reader"] = None
 
 def refine_plate_text(text):
     """Refine plate text based on common patterns and misreads"""
@@ -120,6 +137,7 @@ def clean_plate_text(text):
     import re
     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
     refined = refine_plate_text(cleaned)
+    # Basic length check for plates (e.g. at least 3 chars)
     if refined and len(refined) >= 3:
         return refined
     return None
@@ -142,7 +160,7 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
 
     # Trackers for the session
     track_history = {} # track_id -> {'best_plate': str, 'best_plate_conf': float, 'ocr_count': int, 'consensus_reached': bool}
-    anpr_processor = AnprProcessor(buffer_size=10, min_votes=2)
+    anpr_processor = AnprProcessor(buffer_size=20, min_votes=3)  # Updated parameters
     
     # Process every Nth frame for performance
     process_interval = 2
@@ -203,14 +221,18 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
                         class_name = MODELS["main"].names[cls].lower()
                         
                         detection_type = None
-                        if class_name in ['car', 'truck', 'bus', 'motorcycle', 'person']:
-                            mapping = {'car': 'Car', 'truck': 'Truck', 'bus': 'Truck', 'motorcycle': 'Bike', 'person': 'Human'}
+                        if class_name in ['car', 'truck', 'bus', 'motorcycle', 'bicycle', 'person']:
+                            mapping = {'car': 'Car', 'truck': 'Truck', 'bus': 'Truck', 'motorcycle': 'Bike', 'bicycle': 'Bike', 'person': 'Human'}
                             detection_type = mapping[class_name]
                         
                         if not detection_type: continue
                         
-                        # High-Precision ROI Check
-                        geo_marker_id = check_in_geo_fence(box, geo_fences_list)
+                        # High-Precision ROI Check - Scale back to original dimensions
+                        check_box = box
+                        if track_scale != 1.0:
+                            check_box = [int(box[0] / track_scale), int(box[1] / track_scale), int(box[2] / track_scale), int(box[3] / track_scale)]
+                        
+                        geo_marker_id = check_in_geo_fence(check_box, geo_fences_list)
                         in_fence = geo_marker_id is not None
                         
                         # Process Nozzle results in parallel for the same frame
@@ -222,7 +244,7 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
                         # Create/Get track record
                         if track_id is not None and track_id not in track_history:
                             track_history[track_id] = {'best_plate': None, 'conf': 0, 'ocr_count': 0, 'consensus_reached': False}
-                        current_record = track_history.get(track_id, {'ocr_count': 0, 'consensus_reached': False})
+                        current_record = track_history.get(track_id, {'best_plate': None, 'conf': 0, 'ocr_count': 0, 'consensus_reached': False})
                         
                         plate_text = None
                         
@@ -255,7 +277,7 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
                                 elif w < 800: scale_factor = 1.5
                                 
                                 object_image_detector = cv2.resize(object_crop, (int(w * scale_factor), int(h * scale_factor)), interpolation=cv2.INTER_CUBIC)
-                                plate_results = MODELS["plate"](object_image_detector, conf=0.15, verbose=False)
+                                plate_results = MODELS["plate"](object_image_detector, conf=0.20, verbose=False)
                                     
                                 # Initialize variables
                                 plate_text = None
@@ -285,17 +307,36 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
                                         best_clean_text = None
                                         best_ocr_conf = 0
                                         
-                                        for variant in variants:
-                                            # Use allowlist to filter out noise
-                                            ocr_results = MODELS["reader"].readtext(variant, allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ')
-                                            found_text = "".join([t for _, t, c in ocr_results if c > 0.15])
-                                            clean_text_v = clean_plate_text(found_text)
-                                            
-                                            if clean_text_v:
-                                                v_conf = sum([c for _, _, c in ocr_results if c > 0.15]) / (len(ocr_results) or 1)
-                                                if v_conf > best_ocr_conf:
-                                                    best_ocr_conf = v_conf
-                                                    best_clean_text = clean_text_v
+                                        for i, variant in enumerate(variants):
+                                            # PaddleOCR returns: [[[box], (text, confidence)]]
+                                            try:
+                                                ocr_results = MODELS["reader"].ocr(variant, cls=True)
+                                                if not ocr_results or not ocr_results[0]:
+                                                    continue
+                                                
+                                                # Extract text and confidence
+                                                texts = []
+                                                confidences = []
+                                                for line in ocr_results[0]:
+                                                    if line and len(line) >= 2:
+                                                        text, conf = line[1]
+                                                        if conf > 0.10:
+                                                            texts.append(text)
+                                                            confidences.append(conf)
+                                                
+                                                if not texts:
+                                                    continue
+                                                    
+                                                found_text = "".join(texts)
+                                                clean_text_v = clean_plate_text(found_text)
+                                                
+                                                if clean_text_v:
+                                                    v_conf = sum(confidences) / len(confidences)
+                                                    if v_conf > best_ocr_conf:
+                                                        best_ocr_conf = v_conf
+                                                        best_clean_text = clean_text_v
+                                            except Exception as ocr_err:
+                                                continue
                                         
                                         consensus_text = None
                                         if best_clean_text:
@@ -310,10 +351,23 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
                                         # 2. Blacklist Check (Strip 'POLICE' in refinement)
                                         is_false_positive = False
                                         
-                                        # Area ratio check (plate area / vehicle area)
-                                        plate_area = (px2 - px1) * (py2 - py1)
-                                        vehicle_area_scaled = (x2 - x1) * (y2 - y1) * (scale_factor ** 2)
-                                        if plate_area / vehicle_area_scaled > 0.40: # Relaxed to 0.40
+                                        # 1. Aspect Ratio Check (Plates are rectangular or square-ish)
+                                        pw, ph = (px2 - px1), (py2 - py1)
+                                        aspect_ratio = pw / float(ph) if ph > 0 else 0
+                                        
+                                        # 2. Area ratio check (plate area / vehicle area)
+                                        # Use actual dimensions of the resized detector image
+                                        h_det, w_det = object_image_detector.shape[:2]
+                                        vehicle_area_det = h_det * w_det
+                                        plate_area = pw * ph
+                                        area_ratio = plate_area / vehicle_area_det
+                                        
+                                        # RELAXED Filtering for better recall:
+                                        # - Aspect ratio: 0.8 to 8.0
+                                        # - Area ratio: 0.1% to 40%
+                                        if aspect_ratio < 0.8 or aspect_ratio > 8.0:
+                                            is_false_positive = True
+                                        elif area_ratio < 0.001 or area_ratio > 0.40:
                                             is_false_positive = True
 
                                         if (consensus_text or best_clean_text) and not is_false_positive:
@@ -324,7 +378,7 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
                                             # Update track history if we have track_id
                                             if track_id is not None:
                                                 if track_id not in track_history or p_conf_val > track_history[track_id].get('conf', 0):
-                                                    track_history[track_id] = {'plate': plate_text, 'conf': p_conf_val}
+                                                    track_history[track_id] = {'best_plate': plate_text, 'conf': p_conf_val}
                                             break # Found a plate
                                         elif not is_false_positive:
                                             # Draw plate box even if OCR hasn't succeeded yet
@@ -333,33 +387,35 @@ def generate_frames(camera_id: int, camera_source: str, db: Session):
                         
                         # Use cached plate text if not found in this frame but exists in history
                         if not plate_text and track_id is not None and track_id in track_history:
-                            plate_text = track_history[track_id]['plate']
+                            plate_text = track_history[track_id].get('best_plate')
                             
                         # Draw detection
                         # Always draw vehicle box UNLESS we have a stable plate (consensus)
                         # This ensures the user sees something is happening even if OCR is slow
                         has_stable_plate = track_id is not None and anpr_processor.is_stable(track_id)
                         
-                        if not has_stable_plate:
-                             # Map box from tracking scale back to original resolution for drawing
-                             draw_box = box
-                             if track_scale != 1.0:
-                                 draw_box = [int(box[0] / track_scale), int(box[1] / track_scale), int(box[2] / track_scale), int(box[3] / track_scale)]
-                             
-                             draw_detections(frame, draw_box, detection_type, track_id, plate_text, in_fence)
-                
-                # Draw Specialized Nozzles
-                for n_res in nozzle_results:
-                    if n_res.boxes is None: continue
-                    n_boxes = n_res.boxes.xyxy.cpu().numpy().astype(int)
-                    n_confs = n_res.boxes.conf.cpu().numpy().astype(float)
-                    for n_box, n_conf in zip(n_boxes, n_confs):
-                        # Detect in full resolution
+                        # Always draw detection box (Premium style)
+                        # Map box from tracking scale back to original resolution for drawing
+                        draw_box = box
                         if track_scale != 1.0:
-                            n_box = (n_box / track_scale).astype(int)
+                            draw_box = [int(box[0] / track_scale), int(box[1] / track_scale), int(box[2] / track_scale), int(box[3] / track_scale)]
                         
-                        n_geo_id = check_in_geo_fence(n_box, geo_fences_list)
-                        draw_detections(frame, n_box, "Fuel Nozzle", None, None, n_geo_id is not None)
+                        draw_detections(frame, draw_box, detection_type, track_id, plate_text, in_fence)
+                
+                # Draw Specialized Nozzles (Only if specialized model is loaded)
+                if MODELS.get("nozzle"):
+                    for n_res in nozzle_results:
+                        if n_res.boxes is None: continue
+                        n_boxes = n_res.boxes.xyxy.cpu().numpy().astype(int)
+                        n_confs = n_res.boxes.conf.cpu().numpy().astype(float)
+                        for n_box, n_conf in zip(n_boxes, n_confs):
+                            # Scale box to original resolution for drawing on 4K/standard frame
+                            draw_n_box = n_box
+                            if track_scale != 1.0:
+                                draw_n_box = [int(n_box[0] / track_scale), int(n_box[1] / track_scale), int(n_box[2] / track_scale), int(n_box[3] / track_scale)]
+                            
+                            n_geo_id = check_in_geo_fence(draw_n_box, geo_fences_list)
+                            draw_detections(frame, draw_n_box, "Fuel Nozzle", None, None, n_geo_id is not None)
 
             # Encode frame as JPEG
             ret, buffer = cv2.imencode('.jpg', frame)

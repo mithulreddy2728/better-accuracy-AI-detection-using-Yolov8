@@ -72,24 +72,36 @@ def draw_plate_highlight(frame, bbox, plate_text=None):
     import cv2
     x1, y1, x2, y2 = map(int, bbox)
     
-    # Use a vibrant Yellow for plates (was Cyan-ish)
-    color = (0, 255, 255) # Yellow in BGR
+    # Use a vibrant Cyan for plates (highly visible)
+    color = (255, 255, 0)  # Cyan in BGR (was yellow)
     
-    # Draw a thicker rectangle for the plate
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+    # Draw a THICK rectangle for the plate (increased from 3 to 4)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
     
     if plate_text:
-        # Draw a small background for the text to make it readable
+        # Draw a background for the text to make it readable
         label = plate_text
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
+        font_scale = 0.7  # Increased from 0.5 for better visibility
         thickness = 2
         (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
         
         # Ensure label doesn't go off screen
         label_y = max(y1, label_height + 10)
         
-        cv2.rectangle(frame, (x1, label_y - label_height - 10), (x1 + label_width, label_y), color, -1)
-        cv2.putText(frame, label, (x1, label_y - 5), 
-                    font, font_scale, (0, 0, 0), thickness) # Black text on yellow background
+        # Draw background rectangle
+        cv2.rectangle(frame, (x1, label_y - label_height - 10), (x1 + label_width + 10, label_y), color, -1)
+        cv2.putText(frame, label, (x1 + 5, label_y - 5), 
+                    font, font_scale, (0, 0, 0), thickness)  # Black text on cyan background
+    else:
+        # If no text, show "Detecting..." to indicate plate detection is active
+        label = "Plate Detected"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 2
+        (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+        label_y = max(y1, label_height + 10)
+        cv2.rectangle(frame, (x1, label_y - label_height - 10), (x1 + label_width + 10, label_y), color, -1)
+        cv2.putText(frame, label, (x1 + 5, label_y - 5), 
+                    font, font_scale, (0, 0, 0), thickness)
     return frame

@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
 """
-Video detection service that processes video and sends detections to backend.
-This script uses YOLO to detect objects (including Fuel Nozzles) and vehicles,
-and performs OCR on vehicle license plates.
-
-Usage:
-    python detection_service.py [video_path] [camera_id]
+Advanced AI Detection Service with YOLO Tracking + Tesseract OCR
 """
 
+import os
 import sys
 import cv2
-import time
 import numpy as np
-from datetime import datetime
+import torch
+import logging
+from ultralytics import YOLO
+import requests
+import base64
+import time
+import re
+from collections import defaultdict
 from ai_engine.backend_integration import BackendIntegration
 from ai_engine.geo_fence_utils import check_in_geo_fence
-from ultralytics import YOLO
-import easyocr
-import re
-import logging
-import os
-from ai_engine.image_utils import get_enhancement_variants, upscale_image
+from ai_engine.image_utils import get_enhancement_variants
 from ai_engine.anpr_processor import AnprProcessor
 from pathlib import Path
 
-# Configure logging to stdout so it's captured by the backend
+# Configure logging to write to both file and stdout with UTF-8 encoding
+log_file = os.path.join(os.path.dirname(__file__), '..', 'backend', 'detection_service.log')
 logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)8s] %(filename)s:%(lineno)d - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),  # UTF-8 for emojis
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 
 # Detection type mapping from YOLO classes to our types
@@ -38,6 +39,7 @@ CLASS_MAPPING = {
     'truck': 'Truck',
     'bus': 'Truck',
     'motorcycle': 'Bike',
+    'bicycle': 'Bike',
     'person': 'Human',
 }
 
@@ -48,58 +50,187 @@ CUSTOM_MAPPING = {
 }
 
 def refine_plate_text(text):
-    """Refine plate text based on common patterns and misreads"""
-    if not text: return None
+    """
+    Refine OCR text with common corrections for Indian license plates.
+    Fixes typical OCR errors while avoiding over-correction.
+    Indian plate format: XX00XX0000 (e.g., TS09PAZ063)
+    """
+    if not text or len(text) < 3:
+        return text
     
-    # Common OCR substitutions (Letter -> Number)
-    L2N = {'I': '1', 'L': '1', 'T': '7', 'B': '8', 'S': '5', 'G': '6', 'Z': '2', 'O': '0', 'Q': '0', 'D': '0'}
-    # Number -> Letter
-    N2L = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B'}
+    # Remove common noise patterns
+    noise_patterns = ["POLICE", "GOVT", "TAXI", "AMBULANCE"]
+    for noise in noise_patterns:
+        text = text.replace(noise, "")
     
-    # Standardize to uppercase and strip common noise
-    text = text.upper().replace(" ", "").replace("POLICE", "")
+    if len(text) < 8:  # Too short to be a valid plate
+        return text
     
-    # Shorten text if it's very short
-    if len(text) < 3: return text
+    # Indian plate structure: XX 00 XX 0000
+    # Positions: 0-1 (state), 2-3 (district), 4-6/7 (series), rest (number)
     
-    # Indian Plate Pattern (e.g., TS09PA2069)
-    # Format: [State:AA] [Dist:NN] [Series:AA] [Num:NNNN] -> 8-10 chars
-    # or [State:AA] [Dist:NN] [Num:NNNN] -> 7-8 chars
-    if len(text) >= 7 and text[0:2].isalpha():
-        res = list(text)
-        # Position 2 and 3 should be digits (District)
-        for i in [2, 3]:
-            if i < len(res) and res[i] in L2N: res[i] = L2N[res[i]]
-        # Last 4 should be digits
-        for i in range(len(res)-4, len(res)):
-            if i >= 0 and res[i] in L2N: res[i] = L2N[res[i]]
-        return "".join(res)
-
-    # UK-Specific Pattern (e.g., NA13 NRU -> NA13NRU)
-    # Format: [AA] [NN] [AAA] (7 chars)
-    if len(text) == 7:
-        res = list(text)
-        for i in [2, 3]:
-            if res[i] in L2N: res[i] = L2N[res[i]]
-        for i in [0, 1, 4, 5, 6]:
-            if res[i].isdigit() and res[i] in N2L: res[i] = N2L[res[i]]
-        return "".join(res)
+    # Common OCR corrections for numbers
+    corrections_numeric = {
+        'O': '0',  # Letter O to number 0
+        'I': '1',  # Letter I to number 1
+        'S': '5',  # Letter S to number 5 (but not always - could be in series)
+        'Z': '2',  # Letter Z to number 2
+        'B': '8',  # Letter B to number 8
+        'G': '6',  # Letter G to number 6
+    }
     
-    return text
+    refined = ""
+    for i, char in enumerate(text):
+        # Positions 0-1: State code (always letters) - keep as-is
+        if i < 2:
+            refined += char
+        # Positions 2-3: District number (should be digits) - apply corrections
+        elif 2 <= i < 4:
+            if char in corrections_numeric:
+                refined += corrections_numeric[char]
+            else:
+                refined += char
+        # Positions 4-7: Series letters (PA, PAZ, etc.) - keep letters, but fix obvious errors
+        elif 4 <= i < 8:
+            # Keep letters as-is (including Z, which is valid in series)
+            # Only convert O and I if they're clearly numbers
+            if char.isdigit():
+                refined += char
+            elif char == 'O' and (i >= 7 or (i < len(text) - 1 and text[i+1].isdigit())):
+                # O followed by digit is likely 0
+                refined += '0'
+            elif char == 'I' and (i >= 7 or (i < len(text) - 1 and text[i+1].isdigit())):
+                # I followed by digit is likely 1
+                refined += '1'
+            else:
+                # Keep all other letters including Z, S, etc.
+                refined += char
+        # Positions 8+: Final number (should be all digits) - apply all corrections
+        else:
+            if char in corrections_numeric:
+                refined += corrections_numeric[char]
+            else:
+                refined += char
+    
+    return refined
 
 def clean_plate_text(text):
-    """Clean and validate plate text"""
-    if not text: return None
+    """Clean and validate plate text with Indian license plate pattern matching"""
+    if not text:
+        return None
+    
     # Remove non-alphanumeric characters
     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
     
     # Apply pattern-based refinement
     refined = refine_plate_text(cleaned)
     
-    # Basic length check for plates (e.g. at least 3 chars)
-    if refined and len(refined) >= 3:
-        return refined
-    return None
+    if not refined:
+        return None
+    
+    # Length check: Indian license plates are typically 9-10 characters
+    # Allow 8-12 to handle OCR variations
+    if not (9 <= len(refined) <= 12):
+        logging.debug(f"Rejecting '{refined}' - invalid length ({len(refined)} chars)")
+        return None
+    
+    # Must start with 2 letters (state code)
+    if not (len(refined) >= 2 and refined[0].isalpha() and refined[1].isalpha()):
+        logging.debug(f"Rejecting '{refined}' - doesn't start with 2 letters")
+        return None
+    
+    # CRITICAL: Must end with at least 3 consecutive digits
+    # Indian plates end with 4 digits (e.g., 2063, 1234)
+    # This rejects plates like "HK16E7ST" which end with "ST"
+    trailing_digits = 0
+    for i in range(len(refined) - 1, -1, -1):
+        if refined[i].isdigit():
+            trailing_digits += 1
+        else:
+            break
+    
+    if trailing_digits < 3:
+        logging.debug(f"Rejecting '{refined}' - doesn't end with at least 3 digits (has {trailing_digits})")
+        return None
+    
+    # CRITICAL: License plates must contain BOTH letters AND numbers
+    has_letter = any(c.isalpha() for c in refined)
+    has_number = any(c.isdigit() for c in refined)
+    
+    if not (has_letter and has_number):
+        logging.debug(f"Rejecting '{refined}' - missing letters or numbers")
+        return None
+    
+    # Must have at least 3 digits total (Indian plates have 4+ digits)
+    digit_count = sum(1 for c in refined if c.isdigit())
+    if digit_count < 4:
+        logging.debug(f"Rejecting '{refined}' - too few digits ({digit_count})")
+        return None
+    
+    # Must have at least 3 letters (state code + series)
+    letter_count = sum(1 for c in refined if c.isalpha())
+    if letter_count < 3:
+        logging.debug(f"Rejecting '{refined}' - too few letters ({letter_count})")
+        return None
+    
+    # Reject if too many consecutive same characters (likely OCR error)
+    # Allow 2 consecutive, reject 4+
+    for i in range(len(refined) - 3):
+        if refined[i] == refined[i+1] == refined[i+2] == refined[i+3]:
+            logging.debug(f"Rejecting '{refined}' - has 4+ consecutive same characters")
+            return None
+    
+    # Reject obvious patterns that indicate random text
+    # Check if it's mostly random (too many unique character transitions)
+    if len(refined) >= 10:
+        # Count alternations between letters and numbers
+        alternations = 0
+        for i in range(len(refined) - 1):
+            if (refined[i].isalpha() and refined[i+1].isdigit()) or \
+               (refined[i].isdigit() and refined[i+1].isalpha()):
+                alternations += 1
+        
+        # Indian plates have 2-3 alternations max (XX-00-XX-0000)
+        # Random text has many more alternations
+        if alternations > 4:
+            logging.debug(f"Rejecting '{refined}' - too many alternations ({alternations})")
+            return None
+    
+    return refined
+
+def levenshtein_distance(s1, s2):
+    """Calculate Levenshtein distance between two strings"""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    
+    if len(s2) == 0:
+        return len(s1)
+    
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            # Cost of insertions, deletions, or substitutions
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    
+    return previous_row[-1]
+
+def is_similar_plate(plate1, plate2, threshold=2):
+    """Check if two plates are similar using Levenshtein distance"""
+    if not plate1 or not plate2:
+        return False
+    
+    # Exact match
+    if plate1 == plate2:
+        return True
+    
+    # Fuzzy match with threshold (max 2 character differences)
+    distance = levenshtein_distance(plate1, plate2)
+    return distance <= threshold
 
 def detect_objects_in_video(video_path, camera_id=None):
     """Process video using advanced tracking and send detections to backend"""
@@ -200,26 +331,49 @@ def detect_objects_in_video(video_path, camera_id=None):
     # 3. Nozzle Detector (Specialized)
     print("Loading specialized nozzle detection model...")
     try:
-        # Load high-precision nozzle detector from Hub
-        nozzle_model = YOLO("keremberke/yolov8n-fuel-nozzle-detection").to(device)
-        logging.info("✓ Specialized Nozzle model loaded")
-        print("✓ Specialized Nozzle model loaded")
+        # Try local model first, then Hub
+        local_nozzle = os.path.join(os.path.dirname(__file__), "models", "nozzle_model.pt")
+        if os.path.exists(local_nozzle):
+            nozzle_model = YOLO(local_nozzle).to(device)
+            logging.info(f"✓ Specialized Nozzle model loaded from local: {local_nozzle}")
+            print(f"✓ Specialized Nozzle model loaded from local")
+        else:
+            # Fallback to a known stable model on Hub
+            nozzle_model = YOLO("keremberke/fuel-nozzle-yolov8n").to(device)
+            logging.info("✓ Specialized Nozzle model loaded from Hub")
+            print("✓ Specialized Nozzle model loaded from Hub")
     except Exception as e:
         logging.warning(f"⚠ Failed to load specialized nozzle model: {e}")
+        print(f"  Nozzle detection will use general object detector")
         nozzle_model = None
 
-    # 4. OCR Reader
-    print("Initializing OCR...")
+    # 4. Tesseract OCR Reader (Stable, Windows-compatible)
+    print("Initializing Tesseract OCR...")
     try:
-        # Force GPU and use allowlist for cleaner results
-        reader = easyocr.Reader(['en'], gpu=(device == 'cuda'), verbose=False)
-        # Add allowlist to the reader processing if we were calling it here, 
-        # but we use it in the loop. 
-        logging.info(f"✓ OCR initialized (GPU: {device == 'cuda'})")
-        print(f"✓ OCR initialized (GPU: {device == 'cuda'})")
+        import pytesseract
+        from PIL import Image
+        
+        # Configure Tesseract path (common Windows installation location)
+        tesseract_paths = [
+            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            r'C:\Tesseract-OCR\tesseract.exe'
+        ]
+        
+        for path in tesseract_paths:
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                break
+        
+        # Test Tesseract
+        test_version = pytesseract.get_tesseract_version()
+        reader = pytesseract  # Use pytesseract module as reader
+        logging.info(f"✓ Tesseract OCR initialized (version: {test_version})")
+        print(f"✓ Tesseract OCR initialized (version: {test_version})")
     except Exception as e:
-        logging.warning(f"⚠ Failed to initialize OCR: {e}")
-        print(f"⚠ Failed to initialize OCR: {e}")
+        logging.warning(f"⚠ Failed to initialize Tesseract: {e}")
+        print(f"⚠ Failed to initialize Tesseract: {e}")
+        print("  Please install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki")
         reader = None
     
     # Open video
@@ -265,9 +419,16 @@ def detect_objects_in_video(video_path, camera_id=None):
     
     # Trackers and persistence
     track_history = {} # track_id -> { 'type': str, 'best_plate': str, 'last_sent': float, 'ocr_count': int, 'consensus_reached': bool }
-    anpr_processor = AnprProcessor(buffer_size=10, min_votes=2)
+    # Tracking state
+    track_records = {}  # track_id -> {best_plate, best_plate_conf, plate_img, ...}
+    detected_plates = set()  # Track unique plates already detected in this video
+    
+    # ANPR Processor for multi-frame consensus
+    anpr_processor = AnprProcessor()
     
     frame_count = 0
+    start_time = time.time()
+    
     process_interval = 2 # process every 2nd frame for speed but keep tracking
     
     print("\n" + "=" * 60)
@@ -327,21 +488,32 @@ def detect_objects_in_video(video_path, camera_id=None):
             if frame_count % process_interval != 0:
                 continue
                 
-            # 4K PERFORMANCE OPTIMIZATION:
-            # Downscale high-res frames for tracking/detection to save CPU/GPU
+            # 4K PERFORMANCE & DISTANT OBJECT OPTIMIZATION:
+            # For distant objects, we run detection on multiple scales.
+            # 1. Standard Scale (for general tracking)
             tracking_frame = frame
             track_scale = 1.0
             if width > 1920:
                 track_scale = 1280.0 / width
                 tracking_frame = cv2.resize(frame, (1280, int(height * track_scale)))
                 
-            # Run Tracking
+            # Run Tracking on primary scale
             try:
                 # tracker='botsort.yaml' or 'bytetrack.yaml'
                 results = model.track(tracking_frame, persist=True, device=device, verbose=False)
             except Exception as e:
                 logging.error(f"Tracking error at frame {frame_count}: {e}")
                 continue
+            
+            # 2. Zoomed/High-Res Scale (for distant objects - every 10 frames)
+            if frame_count % 10 == 0 and width >= 1920:
+                # Run detection on a higher resolution for distant objects (no tracking, just detection)
+                # to trigger new tracks or update existing ones
+                try:
+                    hires_results = model(frame, conf=0.15, verbose=False)
+                    # We don't use these results for tracking immediately, 
+                    # but they help YOLO "see" smaller objects in 4K
+                except: pass
             
             for result in results:
                 if result.boxes is None or result.boxes.id is None:
@@ -381,36 +553,43 @@ def detect_objects_in_video(video_path, camera_id=None):
                             'best_plate': None,
                             'last_sent': 0,
                             'best_plate_conf': 0,
+                            'best_object_conf': float(conf),  # Store initial YOLO object detection confidence
                             'ocr_count': 0,
                             'consensus_reached': False
                         }
                     
                     current_record = track_history[track_id]
+                    
+                    # Update best object confidence if current is higher
+                    if float(conf) > current_record.get('best_object_conf', 0):
+                        current_record['best_object_conf'] = float(conf)
+                    
                     should_send = False
                     
                     # ANPR Logic with Performance Throttling
                     # 1. Only process vehicles
                     # 2. Only run OCR if consensus not reached or periodically
                     do_ocr = False
-                    if detection_type in ['Car', 'Truck', 'Bike'] and plate_model and reader:
+                    if detection_type in ['Car', 'Truck', 'Bike'] and reader:  # Removed plate_model requirement
                         # Throttle OCR: Run first frame always, then every 3rd
                         current_record['ocr_count'] += 1
                         if not current_record['consensus_reached'] or current_record['ocr_count'] % 10 == 0:
-                            if current_record['ocr_count'] == 1 or current_record['ocr_count'] % 3 == 0:
+                            if current_record['ocr_count'] == 1 or current_record['ocr_count'] % 5 == 0:
                                 do_ocr = True
+                                logging.info(f"  [Track {track_id}] Triggering OCR (count: {current_record['ocr_count']})")
                     
+                    # Initialize coordinates for original resolution
+                    if track_scale != 1.0:
+                        x1_orig = int(x1 / track_scale)
+                        y1_orig = int(y1 / track_scale)
+                        x2_orig = int(x2 / track_scale)
+                        y2_orig = int(y2 / track_scale)
+                    else:
+                        x1_orig, y1_orig, x2_orig, y2_orig = x1, y1, x2, y2
+
+                    object_image = frame[y1_orig:y2_orig, x1_orig:x2_orig].copy()
+                        
                     if do_ocr:
-                        # Map box from tracking scale back to original resolution if needed
-                        if track_scale != 1.0:
-                            x1_orig = int(x1 / track_scale)
-                            y1_orig = int(y1 / track_scale)
-                            x2_orig = int(x2 / track_scale)
-                            y2_orig = int(y2 / track_scale)
-                        else:
-                            x1_orig, y1_orig, x2_orig, y2_orig = x1, y1, x2, y2
-                            
-                        object_image = frame[y1_orig:y2_orig, x1_orig:x2_orig].copy()
-                            
                         if object_image.size > 0:
                             # Enhancement: Upscale small crops to improve detection
                             h, w = object_image.shape[:2]
@@ -420,17 +599,175 @@ def detect_objects_in_video(video_path, camera_id=None):
                             
                             object_image_detector = cv2.resize(object_image, (int(w * scale_factor), int(h * scale_factor)), interpolation=cv2.INTER_CUBIC)
 
-                            plate_results = plate_model(object_image_detector, conf=0.15, verbose=False)
-                            
                             # Initialize detection variables for this object
                             best_text_to_use = None
                             avg_conf = conf # Use the vehicle confidence as the baseline
                             
-                            for p_res in plate_results:
-                                if p_res.boxes is None: continue
-                                for p_box in p_res.boxes:
-                                    px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy().astype(int)
-                                    p_conf_val = float(p_box.conf[0])
+                            # OCR-ONLY MODE: Process entire vehicle crop when no plate model available
+                            if not plate_model:
+                                logging.info(f"  [Track {track_id}] Using OCR-only mode on vehicle crop")
+                                
+                                # Multi-Pass OCR Enhancement on vehicle crop
+                                variants = get_enhancement_variants(object_image_detector)
+                                logging.info(f"  [Track {track_id}] Generated {len(variants)} enhancement variants")
+                                
+                                best_clean_text = None
+                                best_ocr_conf = 0
+                                
+                                for i, variant in enumerate(variants):
+                                    # Tesseract OCR processing
+                                    try:
+                                        from PIL import Image
+                                        
+                                        # Convert numpy array to PIL Image
+                                        pil_image = Image.fromarray(cv2.cvtColor(variant, cv2.COLOR_BGR2RGB))
+                                        
+                                        # Try multiple Tesseract configurations for best results
+                                        # PSM 7: Single text line (best for license plates)
+                                        # PSM 8: Single word (fallback)
+                                        # PSM 11: Sparse text (for difficult cases)
+                                        configs = [
+                                            r'--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                                            r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                                            r'--psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                                        ]
+                                        
+                                        best_variant_text = None
+                                        best_variant_conf = 0
+                                        best_plate_bbox = None  # Store bounding box for cropping
+                                        
+                                        for config in configs:
+                                            try:
+                                                ocr_data = reader.image_to_data(pil_image, config=config, output_type='dict')
+                                                
+                                                # Extract text with confidence > 0 (very low threshold to catch everything)
+                                                texts = []
+                                                confidences = []
+                                                bboxes = []  # Store bounding boxes
+                                                for j, conf in enumerate(ocr_data['conf']):
+                                                    try:
+                                                        conf_val = int(conf)
+                                                        if conf_val > 0:  # Very low threshold
+                                                            text = ocr_data['text'][j]
+                                                            if text.strip():
+                                                                texts.append(text)
+                                                                confidences.append(conf_val / 100.0)
+                                                                # Store bounding box (x, y, w, h)
+                                                                bboxes.append({
+                                                                    'x': ocr_data['left'][j],
+                                                                    'y': ocr_data['top'][j],
+                                                                    'w': ocr_data['width'][j],
+                                                                    'h': ocr_data['height'][j]
+                                                                })
+                                                    except (ValueError, TypeError):
+                                                        continue
+                                                
+                                                if texts:
+                                                    found_text = "".join(texts)
+                                                    avg_conf = sum(confidences) / len(confidences) if confidences else 0
+                                                    if avg_conf > best_variant_conf:
+                                                        best_variant_conf = avg_conf
+                                                        best_variant_text = found_text
+                                                        # Calculate combined bounding box for all text
+                                                        if bboxes:
+                                                            min_x = min(b['x'] for b in bboxes)
+                                                            min_y = min(b['y'] for b in bboxes)
+                                                            max_x = max(b['x'] + b['w'] for b in bboxes)
+                                                            max_y = max(b['y'] + b['h'] for b in bboxes)
+                                                            best_plate_bbox = (min_x, min_y, max_x, max_y)
+                                            except Exception:
+                                                continue
+                                        
+                                        if not best_variant_text:
+                                            logging.info(f"  [Track {track_id} Var {i}] No text detected")
+                                            continue
+                                            
+                                        logging.info(f"  [Track {track_id} Var {i}] Raw OCR: '{best_variant_text}'")
+                                        clean_text = clean_plate_text(best_variant_text)
+                                        
+                                        if clean_text:
+                                            logging.info(f"  [Track {track_id} Var {i}] Clean OCR: '{clean_text}' (conf: {best_variant_conf:.2f})")
+                                            if best_variant_conf > best_ocr_conf:
+                                                best_ocr_conf = best_variant_conf
+                                                best_clean_text = clean_text
+                                        else:
+                                            logging.info(f"  [Track {track_id} Var {i}] Text filtered out: '{best_variant_text}'")
+                                    except Exception as ocr_err:
+                                        logging.error(f"  [Track {track_id} Var {i}] OCR error: {ocr_err}")
+                                        continue
+                                
+                                if best_clean_text:
+                                    avg_conf = (conf + best_ocr_conf) / 2
+                                    consensus_text = anpr_processor.add_prediction(track_id, best_clean_text, avg_conf)
+                                    best_text_to_use = consensus_text or best_clean_text
+                                    
+                                    if consensus_text and avg_conf > 0.6:
+                                        current_record['consensus_reached'] = True
+                                    
+                                    # Crop plate region if we have bounding box
+                                    plate_image = object_image  # Default to vehicle crop
+                                    if best_plate_bbox:
+                                        try:
+                                            x1, y1, x2, y2 = best_plate_bbox
+                                            # Ensure coordinates are in correct order
+                                            x1, x2 = min(x1, x2), max(x1, x2)
+                                            y1, y2 = min(y1, y2), max(y1, y2)
+                                            
+                                            # Add padding around the plate (10% on each side)
+                                            h, w = object_image.shape[:2]
+                                            pad_x = int((x2 - x1) * 0.1)
+                                            pad_y = int((y2 - y1) * 0.1)
+                                            x1 = max(0, x1 - pad_x)
+                                            y1 = max(0, y1 - pad_y)
+                                            x2 = min(w, x2 + pad_x)
+                                            y2 = min(h, y2 + pad_y)
+                                            
+                                            # Validate crop dimensions
+                                            if x2 > x1 and y2 > y1:
+                                                # Crop the plate region
+                                                plate_image = object_image[y1:y2, x1:x2]
+                                                logging.info(f"  [Track {track_id}] Cropped plate region: {x1},{y1} to {x2},{y2}")
+                                            else:
+                                                logging.warning(f"  [Track {track_id}] Invalid crop dimensions, using full vehicle")
+                                        except Exception as crop_err:
+                                            logging.warning(f"  [Track {track_id}] Failed to crop plate: {crop_err}")
+                                            plate_image = object_image  # Fall back to full vehicle
+                                    
+                                    # Update best plate info
+                                    current_record['best_plate'] = best_text_to_use
+                                    current_record['best_plate_conf'] = avg_conf
+                                    current_record['plate_img'] = plate_image  # Use cropped plate image
+                                    
+                                    # Check if this plate was already detected (exact or similar)
+                                    is_duplicate = False
+                                    for existing_plate in detected_plates:
+                                        if is_similar_plate(best_text_to_use, existing_plate, threshold=2):
+                                            logging.info(f"  [Track {track_id}] ⚠ Plate '{best_text_to_use}' is similar to '{existing_plate}', skipping duplicate")
+                                            is_duplicate = True
+                                            break
+                                    
+                                    if is_duplicate:
+                                        should_send = False  # Don't send duplicate
+                                    else:
+                                        detected_plates.add(best_text_to_use)  # Mark as detected
+                                        should_send = True
+                                        logging.info(f"  [Track {track_id}] ✓ Plate detected: {best_text_to_use} (conf: {avg_conf:.2f})")
+                                else:
+                                    logging.info(f"  [Track {track_id}] OCR Failed on all {len(variants)} variants")
+                            
+                            else:
+                                # PLATE MODEL MODE: Use YOLO to find plate, then OCR
+                                plate_results = plate_model(object_image_detector, conf=0.20, verbose=False)
+                                
+                                if not plate_results or len(plate_results[0].boxes) == 0:
+                                    logging.debug(f"  [Track {track_id}] No plate found by YOLO (conf > 0.20)")
+
+                                for p_res in plate_results:
+                                    if p_res.boxes is None: continue
+                                    for p_box in p_res.boxes:
+                                        px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy().astype(int)
+                                        p_conf_val = float(p_box.conf[0])
+                                        logging.debug(f"  [Track {track_id}] Plate candidate found (YOLO conf: {p_conf_val:.2f})")
                                     
                                     plate_crop = object_image_detector[py1:py2, px1:px2].copy()
                                     if plate_crop.size > 0:
@@ -441,22 +778,42 @@ def detect_objects_in_video(video_path, camera_id=None):
                                         best_ocr_conf = 0
                                         
                                         for i, variant in enumerate(variants):
-                                            # Use allowlist to filter out noise
-                                            ocr_results = reader.readtext(variant, allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ')
-                                            found_text = " ".join([t for _, t, c in ocr_results if c > 0.15])
-                                            clean_text = clean_plate_text(found_text)
-                                            
-                                            if clean_text:
-                                                # Calculate confidence for this variant
-                                                v_conf = sum([c for _, _, c in ocr_results if c > 0.15]) / (len(ocr_results) or 1)
-                                                if i > 0:
-                                                    logging.debug(f"  [Variant {i}] Succeeded: {clean_text} (conf: {v_conf:.2f})")
-                                                if v_conf > best_ocr_conf:
-                                                    best_ocr_conf = v_conf
-                                                    best_clean_text = clean_text
+                                            # PaddleOCR returns: [[[box], (text, confidence)]]
+                                            try:
+                                                ocr_results = reader.ocr(variant, cls=True)
+                                                if not ocr_results or not ocr_results[0]:
+                                                    continue
+                                                
+                                                # Extract text and confidence from PaddleOCR format
+                                                texts = []
+                                                confidences = []
+                                                for line in ocr_results[0]:
+                                                    if line and len(line) >= 2:
+                                                        text, conf = line[1]
+                                                        if conf > 0.10:  # Filter low confidence
+                                                            texts.append(text)
+                                                            confidences.append(conf)
+                                                
+                                                if not texts:
+                                                    continue
+                                                    
+                                                found_text = "".join(texts)
+                                                logging.debug(f"  [Track {track_id} Var {i}] Raw OCR: '{found_text}'")
+                                                clean_text = clean_plate_text(found_text)
+                                                
+                                                if clean_text:
+                                                    # Calculate average confidence
+                                                    v_conf = sum(confidences) / len(confidences)
+                                                    logging.debug(f"  [Track {track_id} Var {i}] Clean OCR: '{clean_text}' (conf: {v_conf:.2f})")
+                                                    if v_conf > best_ocr_conf:
+                                                        best_ocr_conf = v_conf
+                                                        best_clean_text = clean_text
+                                            except Exception as ocr_err:
+                                                logging.debug(f"  [Track {track_id} Var {i}] OCR error: {ocr_err}")
+                                                continue
                                         
                                         if best_clean_text == None:
-                                            logging.debug(f"  [Track {track_id}] OCR Failed on all 4 variants")
+                                            logging.debug(f"  [Track {track_id}] OCR Failed on all {len(variants)} variants")
                                         
                                         # Use AnprProcessor with the best found text
                                         if best_clean_text:
@@ -477,12 +834,25 @@ def detect_objects_in_video(video_path, camera_id=None):
                                         # 2. Blacklist Check (Simplified: We now strip 'POLICE' in refinement)
                                         is_false_positive = False
                                         
-                                        # Area ratio check (plate area / vehicle area)
-                                        # Adjust for scale factor used in detector
-                                        plate_area = (px2 - px1) * (py2 - py1)
-                                        vehicle_area_scaled = (x2 - x1) * (y2 - y1) * (scale_factor ** 2)
+                                        # 1. Aspect Ratio Check (Plates are rectangular or square-ish)
+                                        pw, ph = (px2 - px1), (py2 - py1)
+                                        aspect_ratio = pw / float(ph) if ph > 0 else 0
                                         
-                                        if plate_area / vehicle_area_scaled > 0.40: # Extemely relaxed (40%)
+                                        # 2. Area ratio check (plate area / vehicle area)
+                                        # Use actual dimensions of the crop being processed by the detector
+                                        h_det, w_det = object_image_detector.shape[:2]
+                                        vehicle_area_det = h_det * w_det
+                                        plate_area = pw * ph
+                                        area_ratio = plate_area / vehicle_area_det
+                                        
+                                        # RELAXED Filtering for better recall:
+                                        # - Aspect ratio: 0.8 to 8.0 (handles various plate orientations)
+                                        # - Area ratio: 0.1% to 40% of vehicle crop
+                                        if aspect_ratio < 0.8 or aspect_ratio > 8.0:
+                                            logging.info(f"  [Track {track_id}] Plate filtered (bad aspect: {aspect_ratio:.2f})")
+                                            is_false_positive = True
+                                        elif area_ratio < 0.001 or area_ratio > 0.40:
+                                            logging.info(f"  [Track {track_id}] Plate filtered (bad size ratio: {area_ratio:.3f})")
                                             is_false_positive = True
 
                                         if best_text_to_use and not is_false_positive:
@@ -496,25 +866,45 @@ def detect_objects_in_video(video_path, camera_id=None):
                     now = time.time()
                     # Only send if we updated the plate OR enough time has passed (to avoid flood)
                     if should_send or (now - current_record['last_sent'] > 2):
-                        # Relaxed Filter:
-                        # 1. If it's NOT a vehicle (e.g. Human), send it.
-                        # 2. If it IS a vehicle, wait for a plate OR at least 3 OCR attempts
-                        is_vehicle = detection_type in ['Car', 'Truck', 'Bike']
-                        if not is_vehicle or current_record['best_plate'] or current_record['ocr_count'] > 3:
-                            # Check if detection is within any geo-fence
-                            bbox = [x1, y1, x2, y2]
-                            geo_marker_id = check_in_geo_fence(bbox, geo_fences)
+                        # Use original resolution coordinates for backend
+                        if True: # Send all tracked objects immediately (Humans, Cars, Trucks, etc.)
+                            # Use original resolution coordinates for backend
+                            bbox_orig = [x1_orig, y1_orig, x2_orig, y2_orig]
+                            geo_marker_id = check_in_geo_fence(bbox_orig, geo_fences)
+                            
+                            object_image_full = frame[y1_orig:y2_orig, x1_orig:x2_orig].copy()
+                            
+                            # RESOLUTION ENHANCEMENT: Upscale small crops for better web visibility
+                            if object_image_full.size > 0:
+                                h_i, w_i = object_image_full.shape[:2]
+                                if w_i < 320 or h_i < 320:
+                                    scale = max(1.0, 320 / min(w_i, h_i))
+                                    if scale > 1.0:
+                                        object_image_full = cv2.resize(object_image_full, (int(w_i * scale), int(h_i * scale)), interpolation=cv2.INTER_CUBIC)
+                            
+                            # Confidence score represents YOLO object detection confidence
+                            # This is how confident the AI is about detecting the object type (Car, Truck, Human, etc.)
+                            # Use the best confidence seen across all frames for this track
+                            object_confidence = current_record.get('best_object_conf', float(conf))
+                            
+                            # Ensure confidence is in valid range (0.0 to 1.0)
+                            object_confidence = max(0.0, min(1.0, object_confidence))
+                            
+                            # Log confidence for debugging
+                            plate_conf = current_record.get('best_plate_conf', 'N/A')
+                            logging.info(f"[Track {track_id}] Object confidence: current={conf:.3f}, best={object_confidence:.3f}, Plate: {plate_conf}")
                             
                             detection_data = {
                                 "detection_type": detection_type,
                                 "camera_id": camera_id,
                                 "track_id": track_id,
-                                "confidence_score": conf,
-                                "object_image": object_image,
+                                "confidence_score": object_confidence,
+                                "object_image": object_image_full,
                                 "numberplate_text": current_record['best_plate'],
                                 "numberplate_image": current_record.get('plate_img'),
                                 "geo_marker_id": geo_marker_id
                             }
+                            logging.debug(f"[Track {track_id}] Sending confidence: vehicle={conf:.3f}, best={object_confidence:.3f}")
                             # Send detection and check for STOP signal (camera deleted)
                             result = backend.send_detection(detection_data)
                             if result == "STOP":
@@ -528,38 +918,46 @@ def detect_objects_in_video(video_path, camera_id=None):
                                 fence_info = f" [Geo-Fence: {geo_marker_id}]" if geo_marker_id else ""
                                 logging.info(f"🚀 [Track {track_id}] {detection_type} Sent! Plate: {plate_info}{fence_info}")
 
-            # NEW: Specialized Nozzle Detection for this Frame
+            # Specialized Nozzle Detection
             if nozzle_model:
                 try:
-                    # Run on tracking scale for speed, but adjust boxes later
-                    n_results = nozzle_model(tracking_frame, conf=0.25, verbose=False)
-                    for n_res in n_results:
-                        if n_res.boxes is None: continue
-                        n_boxes = n_res.boxes.xyxy.cpu().numpy().astype(int)
-                        n_confs = n_res.boxes.conf.cpu().numpy().astype(float)
-                        
-                        for n_box, n_conf in zip(n_boxes, n_confs):
-                            # Map to original resolution
-                            if track_scale != 1.0:
-                                x1_n, y1_n, x2_n, y2_n = (n_box / track_scale).astype(int)
-                            else:
+                    # Run on original frame for better precision if object is distant
+                    # Throttled to every 4th frame for performance
+                    if frame_count % 4 == 0:
+                        n_results = nozzle_model(frame, conf=0.30, verbose=False) 
+                        for n_res in n_results:
+                            if n_res.boxes is None: continue
+                            n_boxes = n_res.boxes.xyxy.cpu().numpy().astype(int)
+                            n_confs = n_res.boxes.conf.cpu().numpy().astype(float)
+                            
+                            for n_box, n_conf in zip(n_boxes, n_confs):
                                 x1_n, y1_n, x2_n, y2_n = n_box
-                            
-                            n_crop = frame[y1_n:y2_n, x1_n:x2_n].copy()
-                            if n_crop.size == 0: continue
-                            
-                            n_geo_id = check_in_geo_fence([x1_n, y1_n, x2_n, y2_n], geo_fences)
-                            
-                            # Send Nozzle Detection
-                            n_data = {
-                                "detection_type": "Fuel Nozzle",
-                                "camera_id": camera_id,
-                                "confidence_score": n_conf,
-                                "object_image": n_crop,
-                                "geo_marker_id": n_geo_id
-                            }
-                            backend.send_detection(n_data)
-                            logging.info(f"🚀 [Nozzle] Fuel Nozzle Detected & Sent! {f'[Geo: {n_geo_id}]' if n_geo_id else ''}")
+                                
+                                # Safety crop
+                                y1_n, y2_n = max(0, y1_n), min(height, y2_n)
+                                x1_n, x2_n = max(0, x1_n), min(width, x2_n)
+                                
+                                n_crop = frame[y1_n:y2_n, x1_n:x2_n].copy()
+                                if n_crop.size == 0: continue
+                                
+                                # RESOLUTION ENHANCEMENT for Nozzle
+                                hn, wn = n_crop.shape[:2]
+                                if wn < 320 or hn < 320:
+                                    n_scale = max(1.0, 320 / min(wn, hn))
+                                    n_crop = cv2.resize(n_crop, (int(wn * n_scale), int(hn * n_scale)), interpolation=cv2.INTER_CUBIC)
+
+                                n_geo_id = check_in_geo_fence([x1_n, y1_n, x2_n, y2_n], geo_fences)
+                                
+                                # Send Nozzle Detection
+                                n_data = {
+                                    "detection_type": "Fuel Nozzle",
+                                    "camera_id": camera_id,
+                                    "confidence_score": n_conf,
+                                    "object_image": n_crop,
+                                    "geo_marker_id": n_geo_id
+                                }
+                                backend.send_detection(n_data)
+                                logging.info(f"🚀 [Nozzle] Fuel Nozzle Detected & Sent! {f'[Geo: {n_geo_id}]' if n_geo_id else ''}")
                 except Exception as e:
                     logging.error(f"Nozzle detection error: {e}")
 
@@ -578,7 +976,7 @@ def detect_objects_in_video(video_path, camera_id=None):
         sys.exit(0)
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows() not needed for headless processing
         print("\n✓ Detection service terminated gracefully")
 
 def main():

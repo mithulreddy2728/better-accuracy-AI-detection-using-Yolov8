@@ -99,6 +99,7 @@ def store_detection(detection: DetectionCreate, db: Session = Depends(get_db), c
         }
     else:
         # Create new detection
+        print(f"DEBUG: Received confidence_score from AI engine: {detection.confidence_score} (type: {type(detection.confidence_score)})")
         db_detection = Detection(
             camera_id=detection.camera_id,
             geo_marker_id=detection.geo_marker_id,
