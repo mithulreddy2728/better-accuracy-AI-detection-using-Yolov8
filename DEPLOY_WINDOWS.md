@@ -15,9 +15,10 @@
 6. [Start All Services](#6-start-all-services)
 7. [Create Admin User](#7-create-admin-user)
 8. [Open the App in Browser](#8-open-the-app-in-browser)
-9. [Initialize Git & Push to GitHub](#9-initialize-git--push-to-github)
-10. [Stop / Restart Services](#10-stop--restart-services)
-11. [Troubleshooting on Windows](#11-troubleshooting-on-windows)
+9. [Connect Live Laptop Webcam](#9-connect-live-laptop-webcam)
+10. [Initialize Git & Push to GitHub](#10-initialize-git--push-to-github)
+11. [Stop / Restart Services](#11-stop--restart-services)
+12. [Troubleshooting on Windows](#12-troubleshooting-on-windows)
 
 ---
 
@@ -158,7 +159,7 @@ You will see output like:
  => [ai-engine] pip install...
 ```
 
-If there are any errors, scroll up to find them — see [Troubleshooting](#11-troubleshooting-on-windows).
+If there are any errors, scroll up to find them — see [Troubleshooting](#12-troubleshooting-on-windows).
 
 ---
 
@@ -229,7 +230,33 @@ Log in with the username and password you just created.
 
 ---
 
-## 9. Initialize Git & Push to GitHub
+## 9. Connect Live Laptop Webcam
+
+Because Docker containers run inside an isolated virtual machine, they cannot access your physical built-in webcam (Device 0) directly. To stream your laptop's camera to the Docker AI stack:
+
+### Step 1: Run the Streamer Script on Host
+1. Open a new PowerShell terminal on your host machine.
+2. Install OpenCV if not already present:
+   ```powershell
+   pip install opencv-python
+   ```
+3. Run the streaming utility from the project root:
+   ```powershell
+   python ai_engine/share_webcam.py
+   ```
+This captures your built-in camera and broadcasts it locally at `http://localhost:8085/stream`.
+
+### Step 2: Register the Stream in Web UI
+1. Navigate to the frontend dashboard (http://localhost).
+2. Go to **Cameras** in the sidebar.
+3. Click **Add Camera**:
+   - **Type**: `URL`
+   - **Source**: `http://host.docker.internal:8085/stream` (This allows the container to talk to the host machine)
+4. Click **Save** and start monitoring! The AI engine will connect to your stream and perform real-time tracking and detections.
+
+---
+
+## 10. Initialize Git & Push to GitHub
 
 Since the project has no `.git` folder yet, here's how to set it up:
 
@@ -260,7 +287,7 @@ git push -u origin main
 
 ---
 
-## 10. Stop / Restart Services
+## 11. Stop / Restart Services
 
 ```powershell
 # Stop all services (data is preserved)
@@ -284,7 +311,7 @@ docker compose down -v
 
 ---
 
-## 11. Troubleshooting on Windows
+## 12. Troubleshooting on Windows
 
 ### ❌ `docker: command not found` or `'docker' is not recognized`
 

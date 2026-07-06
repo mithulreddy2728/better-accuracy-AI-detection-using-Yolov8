@@ -234,6 +234,20 @@ type backend\detection_service.log
      - Objects outside the ROI are marked in **Red**
      - **Live ANPR**: License plates are automatically detected and displayed for any vehicle entering the ROI area
 
+#### 🎥 Connecting your Laptop's Built-in Webcam
+Docker runs inside an isolated virtual machine and cannot access physical hardware cameras directly. To connect your laptop's webcam:
+1. Install OpenCV on your host machine:
+   ```bash
+   pip install opencv-python
+   ```
+2. Start the streamer utility from the project root:
+   ```bash
+   python ai_engine/share_webcam.py
+   ```
+3. Go to **Cameras** -> **Add Camera** in the web dashboard.
+4. Add it as a **URL** camera type with the source: `http://host.docker.internal:8085/stream`.
+5. Select this camera in the Live Monitoring dashboard to stream and analyze your webcam in real-time.
+
 ## 🏗️ Project Structure
 
 ```
@@ -277,6 +291,7 @@ c:/projects/nozz/
 │   ├── detection_service.py         # Main detection script
 │   ├── backend_integration.py       # API communication
 │   ├── download_plate_model.py      # Model download utility
+│   ├── share_webcam.py              # Host webcam streaming utility
 │   └── models/
 │       ├── README.md                # Model setup guide
 │       └── license_plate.pt         # Plate detection model (optional)
