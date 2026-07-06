@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+detection_service.log
+
+# Environment variables
+.env
+.env.local
+
+# Node modules
+node_modules/
+frontend/node_modules/
+frontend/build/
+
+# Media files (videos/images)
+backend/media/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Model files (large)
+*.pt
+!ai_engine/models/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ultralytics cache
+ultralytics/
+
+# Docker
+docker-compose.override.yml
+
+# Git
+.git/index.lock
